@@ -1,0 +1,182 @@
+#!/bin/bash
+
+# Copyright (C) 2016-2018 Andrew Clemons, Wellington New Zealand
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of
+# this software and associated documentation files (the "Software"), to deal in
+# the Software without restriction, including without limitation the rights to
+# use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+# the Software, and to permit persons to whom the Software is furnished to do so,
+# subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+# FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+# COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+# IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+# CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+GRUB=false
+LILO=false
+VTCOL=false
+VTCOL_SCHEME=
+
+set -e
+
+usage() {
+  cat << EOF | sed 's/^    //'
+    Usage: slack-kernel-hook
+
+    slack-kernel-hook can be used to automatically build up your initrd and configure
+    your bootloader if you are generic kernel user.
+
+    You should put your required configuration for mkinitrd in /etc/mkinitrd.conf
+
+    This will most definitely not fit all cases, but it works for me.
+
+    Example:
+      # slackroll batch upgrade-kernel
+      # slack-kernel-hook
+      # reboot
+      # slackroll batch clean-kernel
+      # slack-kernel-hook
+
+    Options:
+      --grub         - Uses grub as the bootloader. This is the default.
+      --lilo         - Uses lilo as the bootloader.
+      --vtcol        - Adds vtcol to the initrd. Requires vtcol.
+      --vtcol-scheme - The scheme to configure for vtcol. Defaults to solarized_dark
+EOF
+}
+
+# shellcheck disable=SC2159
+while [ 0 ]; do
+  if [ "x$1" = "x-h" ] || [ "x$1" = "x-help" ] || [ "x$1" = "x--help" ]; then
+    usage | less -F -X
+    exit 0
+  elif [ "x$1" = "x--grub" ]; then
+    GRUB=true
+    shift
+  elif [ "x$1" = "x--lilo" ]; then
+    LILO=true
+    shift
+  elif [ "x$1" = "x--vtcol" ]; then
+    VTCOL=true
+    shift
+  elif [ "x$1" = "x--vtcol-scheme" ]; then
+    shift
+
+    if [ "x$1" = "x" ]; then
+      >&2 echo "--vtcol-scheme requires an argument."
+      exit 1
+    fi
+
+    VTCOL_SCHEME="$1"
+
+    shift
+  elif [ "x$1" = "x" ]; then
+    break
+  else
+    >&2 echo "Unknown token $1"
+    exit 1
+  fi
+done
+
+if ! $GRUB && ! $LILO ; then
+  GRUB=true
+fi
+
+if [ ! -e /etc/mkinitrd.conf ] ; then
+  >&2 echo "/etc/mkinitrd.conf not found"
+  exit 1
+fi
+
+if $VTCOL && ! command -v vtcol > /dev/null 2>&1 ; then
+  >&2 echo "vtcol not installed"
+  exit 1
+fi
+
+if $VTCOL ; then
+  VTCOL_SCHEME=${VTCOL_SCHEME:-solarized_dark}
+fi
+
+if ! $VTCOL && [ ! -z "$VTCOL_SCHEME" ] ; then
+  >&2 echo "--vtcol-scheme does not makes sense without --vtcol."
+  exit 1
+fi
+
+if $VTCOL ; then
+  mapfile -t schemes < <(vtcol --list | sed 1d | rev | cut -d' ' -f1 | rev)
+
+  if case "${schemes[@]}" in  *"$VTCOL_SCHEME"*) false ;; *) true ;; esac ; then
+    >&2 echo "$VTCOL_SCHEME is not a valid vtcol scheme."
+    exit 1
+  fi
+fi
+
+if $LILO && [ ! -e /etc/lilo.conf ] ; then
+  >&2 echo "/etc/lilo.conf is required to use lilo as the bootloader."
+  exit 1
+fi
+
+if $LILO && ! grep '^# Linux bootable partition config begins' /etc/lilo.conf > /dev/null 2>&1 ; then
+  >&2 echo "/etc/lilo.conf should contain '# Linux bootable partition config begins'."
+  >&2 echo "This script will add the kernel images after that line"
+
+  exit 1
+fi
+
+rm -rf /boot/initrd-*
+
+if $LILO ; then
+  sed '/^# Linux bootable partition config begins/q' /etc/lilo.conf > /etc/lilo.conf.new
+fi
+
+# sort newest first
+# on 32bit, if we have both generic-smp and generic installed, prefer smp in the lilo config
+{
+  find /boot -name 'vmlinuz-generic-smp-*' -print0 | xargs -0 -I {} basename {} | sed '/^smp-/d'
+  find /boot -name 'vmlinuz-generic-*' -print0 | xargs -0 -I {} basename {} | sed '/smp/d'
+} | cut -d- -f3- | sort -V -r | while read -r kernel ; do
+  full_kernel="$kernel"
+  kernel=${kernel#smp-}
+
+  mkinitrd -F -c -k "$kernel" \
+    -o /boot/initrd-"$kernel".gz \
+    -s /tmp/initrd-tree-"$kernel"
+
+  if $VTCOL ; then
+    install -m 755 /usr/bin/vtcol "/tmp/initrd-tree-$kernel/sbin/vtcol"
+    sed -i "/^sleep/a \\/sbin\\/vtcol --scheme '$VTCOL_SCHEME' || true" /tmp/initrd-tree-"$kernel"/init
+
+    mkinitrd -F -k "$kernel" \
+      -o /boot/initrd-"$kernel".gz \
+      -s /tmp/initrd-tree-"$kernel"
+  fi
+
+  rm -rf /tmp/initrd-tree-"$kernel"
+
+  if $LILO ; then
+    {
+      printf "image = /boot/%s\\n" "vmlinuz-generic-$full_kernel"
+      printf "  root = %s\\n" "$(source /etc/mkinitrd.conf && echo "$ROOTDEV")"
+      printf "  initrd = /boot/initrd-%s.gz\\n" "$kernel"
+      printf "  label = Lnx-%s\\n" "$kernel"
+      printf "  read-only\\n"
+    } >> /etc/lilo.conf.new
+  fi
+done
+
+if $GRUB ; then
+  grub-mkconfig -o /boot/grub/grub.cfg
+elif $LILO ; then
+  printf "# Linux bootable partition config ends\\n" >> /etc/lilo.conf.new
+  mv /etc/lilo.conf.new /etc/lilo.conf
+
+  lilo
+else
+  exit 1
+fi

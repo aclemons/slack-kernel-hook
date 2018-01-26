@@ -19,12 +19,15 @@
 # IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+set -e
+
+EARLYSSH=false
+
 GRUB=false
 LILO=false
+
 VTCOL=false
 VTCOL_SCHEME=
-
-set -e
 
 usage() {
   cat << EOF | sed 's/^    //'
@@ -39,7 +42,7 @@ usage() {
 
     Example:
       # slackroll batch upgrade-kernel
-      # slack-kernel-hook
+      # slack-kernel-hook --early-ssh --vtcol
       # reboot
       # slackroll batch clean-kernel
       # slack-kernel-hook
@@ -49,6 +52,7 @@ usage() {
       --lilo         - Uses lilo as the bootloader.
       --vtcol        - Adds vtcol to the initrd. Requires vtcol.
       --vtcol-scheme - The scheme to configure for vtcol. Defaults to solarized_dark
+      --early-ssh    - Adds early-ssh to the initrd. Requires early-ssh.
 EOF
 }
 
@@ -57,6 +61,9 @@ while [ 0 ]; do
   if [ "x$1" = "x-h" ] || [ "x$1" = "x-help" ] || [ "x$1" = "x--help" ]; then
     usage | less -F -X
     exit 0
+  elif [ "x$1" = "x--early-ssh" ]; then
+    EARLYSSH=true
+    shift
   elif [ "x$1" = "x--grub" ]; then
     GRUB=true
     shift
@@ -96,6 +103,16 @@ fi
 
 if $VTCOL && ! command -v vtcol > /dev/null 2>&1 ; then
   >&2 echo "vtcol not installed"
+  exit 1
+fi
+
+if $EARLYSSH && [ ! -e /usr/share/mkinitrd/hooks/early_ssh ] ; then
+  >&2 echo "early not installed"
+  exit 1
+fi
+
+if $EARLYSSH && [ ! -e /etc/early-ssh/early-ssh.conf ] ; then
+  >&2 echo "/etc/early-ssh/early-ssh.conf not found"
   exit 1
 fi
 
@@ -150,11 +167,36 @@ fi
 
   if $VTCOL ; then
     install -m 755 /usr/bin/vtcol "/tmp/initrd-tree-$kernel/sbin/vtcol"
-    sed -i "/^sleep/a \\/sbin\\/vtcol --scheme '$VTCOL_SCHEME' || true" /tmp/initrd-tree-"$kernel"/init
+    sed -i "/^sleep/a \
+\\/sbin\\/vtcol --scheme '$VTCOL_SCHEME' || true" "/tmp/initrd-tree-$kernel/init"
+  fi
 
+  if $EARLYSSH ; then
+    true > "/tmp/initrd-tree-$kernel/luksdev"
+    DESTDIR="/tmp/initrd-tree-$kernel" /usr/share/mkinitrd/hooks/early_ssh
+    sed -i '/^[[:space:]]*if \[ -x \/sbin\/cryptsetup \]/i \
+  \/early_ssh' "/tmp/initrd-tree-$kernel/init"
+  fi
+
+  if $VTCOL ; then
     mkinitrd -F -k "$kernel" \
       -o /boot/initrd-"$kernel".gz \
       -s /tmp/initrd-tree-"$kernel"
+  elif $EARLYSSH ; then
+    # if we have a LUKSDEV configured in the /etc/mkinitrd.conf, remove it,
+    # otherwise after we manually unlock the device, the initrd will again try
+    # to unlock it.
+    if grep LUKSDEV /etc/mkinitrd.conf > /dev/null 2>&1 ; then
+      mkinitrd -F -k "$kernel" \
+        -m '' -C '' \
+        -o /boot/initrd-"$kernel".gz \
+        -s /tmp/initrd-tree-"$kernel"
+    else
+      mkinitrd -F -k "$kernel" \
+        -m '' \
+        -o /boot/initrd-"$kernel".gz \
+        -s /tmp/initrd-tree-"$kernel"
+    fi
   fi
 
   rm -rf /tmp/initrd-tree-"$kernel"

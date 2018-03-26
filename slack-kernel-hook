@@ -213,7 +213,17 @@ fi
 done
 
 if $GRUB ; then
-  grub-mkconfig -o /boot/grub/grub.cfg
+  if [ -d /boot/grub ] ; then
+    grub-mkconfig -o /boot/grub/grub.cfg
+  fi
+
+  if [ -e /boot/boot/grub.cfg ] ; then
+    grub-mkconfig -o /boot/boot/grub.cfg
+  fi
+
+  if [ -e /boot/EFI/Boot/grub.cfg ] ; then
+    grub-mkconfig -o /boot/EFI/Boot/grub.cfg
+  fi
 elif $LILO ; then
   printf "# Linux bootable partition config ends\\n" >> /etc/lilo.conf.new
   mv /etc/lilo.conf.new /etc/lilo.conf

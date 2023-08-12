@@ -29,6 +29,8 @@ LILO=false
 VTCOL=false
 VTCOL_SCHEME=
 
+AMD_UCODE=false
+
 usage() {
   cat << EOF | sed 's/^    //'
     Usage: slack-kernel-hook
@@ -53,7 +55,18 @@ usage() {
       --vtcol        - Adds vtcol to the initrd. Requires vtcol.
       --vtcol-scheme - The scheme to configure for vtcol. Defaults to solarized_dark
       --early-ssh    - Adds early-ssh to the initrd. Requires early-ssh.
+      --amd-ucode    - Regenerate amd-ucode.img.
 EOF
+}
+
+amd_uc() {
+  local dir="$1"
+  (
+    cd "$dir"
+    mkdir -p kernel/x86/microcode
+    cat /lib/firmware/amd-ucode/microcode_amd*.bin > kernel/x86/microcode/AuthenticAMD.bin
+    echo kernel/x86/microcode/AuthenticAMD.bin | bsdtar --uid 0 --gid 0 -cnf - -T - | bsdtar --null -cf - --format=newc @- > /boot/amd-ucode.img
+  )
 }
 
 # shellcheck disable=SC2159
@@ -72,6 +85,9 @@ while [ 0 ]; do
     shift
   elif [ "x$1" = "x--vtcol" ]; then
     VTCOL=true
+    shift
+  elif [ "x$1" = "x--amd-ucode" ]; then
+    AMD_UCODE=true
     shift
   elif [ "x$1" = "x--vtcol-scheme" ]; then
     shift
@@ -132,6 +148,13 @@ if $VTCOL ; then
     >&2 echo "$VTCOL_SCHEME is not a valid vtcol scheme."
     exit 1
   fi
+fi
+
+if $AMD_UCODE ; then
+  AMDWORKDIR="$(mktemp -t tmp.XXXXXXXXXX -d)"
+  trap 'rm -rf "$AMDWORKDIR"' INT TERM HUP QUIT EXIT
+
+  amd_uc "$AMDWORKDIR"
 fi
 
 if $LILO && [ ! -e /etc/lilo.conf ] ; then
